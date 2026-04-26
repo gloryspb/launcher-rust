@@ -1,0 +1,42 @@
+# =========================
+# Rust / Cargo
+# =========================
+
+/target/
+**/target/
+
+Cargo.lock
+
+# =========================
+# IDE / Editors
+# =========================
+
+.idea/
+.vscode/
+*.code-workspace
+
+# Rust Analyzer cache
+.rust-analyzer/
+
+# =========================
+# OS artifacts
+# =========================
+
+.DS_Store
+Thumbs.db
+
+# =========================
+# Logs / temp files
+# =========================
+
+*.log
+*.tmp
+
+# =========================
+# Optional: GUI runtime junk
+# =========================
+
+*.pdb
+*.dll
+*.so
+*.dylib
