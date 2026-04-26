@@ -107,13 +107,14 @@ pub enum Message {
     PickExeResult(Option<PathBuf>),
     PickIconResult(Option<PathBuf>),
     PickAddMultiResult(Option<Vec<PathBuf>>),
+    WindowResized(f32),
 }
 
 pub struct Launcher {
     app_dir: PathBuf,
     store: GameStore,
     view_mode: ViewMode,
-    /// Selected game ids (list: ctrl toggles; tiles: ctrl toggles).
+    window_width: f32,
     selection: HashSet<String>,
     modifiers: keyboard::Modifiers,
     last_click: Option<(String, Instant)>,
@@ -130,6 +131,7 @@ impl Launcher {
                 app_dir,
                 store,
                 view_mode: ViewMode::List,
+                window_width: 920.0,
                 selection: HashSet::new(),
                 modifiers: keyboard::Modifiers::default(),
                 last_click: None,
@@ -146,6 +148,9 @@ impl Launcher {
             event::listen_with(|event, _status, _id| match event {
                 Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
                     Some(Message::ModifiersChanged(m))
+                }
+                Event::Window(window::Event::Resized(size)) => {
+                    Some(Message::WindowResized(size.width as f32))
                 }
                 _ => None,
             }),
@@ -546,6 +551,10 @@ impl Launcher {
                 self.modal = Modal::None;
                 Task::none()
             }
+            Message::WindowResized(width) => {
+                self.window_width = width;
+                Task::none()
+            }
         }
     }
 
@@ -645,13 +654,26 @@ impl Launcher {
             ViewMode::Tiles => self.view_tiles(),
         };
 
+        let body_container = container(body)
+            .height(Fill)
+            .padding(4)
+            .style(|_theme| container::Style {
+                background: Some(Color::from_rgb8(0x10, 0x14, 0x24).into()),
+                border: iced::Border {
+                    radius: 8.0.into(),
+                    color: Color::from_rgb8(0x3a, 0x40, 0x5a),
+                    width: 1.0,
+                },
+                ..Default::default()
+            });
+
         let main = column![
             text("GAME LAUNCHER").size(20),
             mode_badge,
             status,
             toolbar,
             reorder,
-            container(body).height(Fill).padding(8),
+            body_container,
             text(format!(
                 "Данные: {}",
                 self.store.config_path.display()
@@ -910,36 +932,12 @@ impl Launcher {
             .height(Fill)
             .center_x(Fill)
             .center_y(Fill)
-            .style(|_theme| container::Style {
-                background: Some(Color::from_rgb8(0x10, 0x14, 0x24).into()),
-                border: iced::Border {
-                    radius: 8.0.into(),
-                    color: Color::from_rgb8(0x3a, 0x40, 0x5a),
-                    width: 1.0,
-                },
-                ..Default::default()
-            })
             .padding(16)
             .into()
         } else {
             let list_column: Vec<Element<'_, Message>> = self.store.games.iter().map(|g| self.game_row_list(g)).collect();
-            let list_container = container(
-                column(list_column)
-                    .spacing(2)
-                    .width(Fill),
-            )
-            .style(|_theme| container::Style {
-                background: Some(Color::from_rgb8(0x10, 0x14, 0x24).into()),
-                border: iced::Border {
-                    radius: 8.0.into(),
-                    color: Color::from_rgb8(0x3a, 0x40, 0x5a),
-                    width: 1.0,
-                },
-                ..Default::default()
-            })
-            .padding(4);
 
-            scrollable(list_container)
+            scrollable(column(list_column).spacing(2).width(Fill))
                 .height(Fill)
                 .into()
         }
@@ -1014,54 +1012,90 @@ impl Launcher {
     }
 
     fn view_tiles(&self) -> Element<'_, Message> {
-        const COLS: usize = 4;
-        let mut rows_e: Vec<Element<'_, Message>> = Vec::new();
         let games = &self.store.games;
-        let mut col = 0usize;
-        let mut current = row![].spacing(8).align_y(Alignment::Start);
-        for g in games {
-            let tile = self.game_tile(g);
-            current = current.push(tile);
-            col += 1;
-            if col >= COLS {
-                rows_e.push(current.into());
-                current = row![].spacing(8);
-                col = 0;
-            }
-        }
-        if col > 0 {
-            rows_e.push(current.into());
-        }
-        scrollable(column(rows_e).spacing(12).width(Fill))
+        if games.is_empty() {
+            container(
+                text("Нет игр. Добавь игры кнопкой выше или перетащи сюда .lnk / .exe")
+                    .size(14)
+                    .style(|_| text::Style {
+                        color: Some(Color::from_rgb8(0x88, 0x88, 0x98)),
+                    }),
+            )
+            .width(Fill)
             .height(Fill)
+            .center_x(Fill)
+            .center_y(Fill)
+            .padding(16)
             .into()
+        } else {
+            let total = games.len();
+            let tile_width: f32 = 100.0;
+            let spacing: f32 = 8.0;
+            let inner_padding: f32 = 8.0;
+            let content_width = self.window_width - inner_padding * 2.0;
+            let cols = ((content_width - spacing) / (tile_width + spacing)).floor() as usize;
+            let cols = cols.max(1);
+            let rows = (total + cols - 1) / cols;
+
+            let mut row_elements: Vec<Element<'_, Message>> = Vec::new();
+            for row_idx in 0..rows {
+                let mut row_tiles: Vec<Element<'_, Message>> = Vec::new();
+                for col_idx in 0..cols {
+                    let idx = row_idx * cols + col_idx;
+                    if idx < total {
+                        row_tiles.push(self.game_tile(&games[idx], tile_width));
+                    } else {
+                        row_tiles.push(container(horizontal_space()).width(Length::Fixed(tile_width)).into());
+                    }
+                }
+                row_elements.push(row(row_tiles).spacing(spacing).align_y(Alignment::Start).into());
+            }
+
+            scrollable(column(row_elements).spacing(spacing))
+                .height(Fill)
+                .into()
+        }
     }
 
-    fn game_tile<'a>(&'a self, g: &'a Game) -> Element<'a, Message> {
+    fn game_tile<'a>(&'a self, g: &'a Game, width: f32) -> Element<'a, Message> {
         let selected = self.selection.contains(&g.id);
         let icon_el = icon_widget(
             &g.icon,
             self.store.config_path.parent().unwrap_or(Path::new(".")),
-            72,
+            64,
         );
-        let title = text(&g.name).size(12).align_x(Center).width(Fill);
+        let name = if g.name.len() > 15 {
+            format!("{}...", &g.name[..12])
+        } else {
+            g.name.clone()
+        };
+        let title = text(name).size(12).align_x(Center);
         let inner = column![icon_el, title]
-            .spacing(6)
+            .spacing(4)
             .align_x(Center)
-            .width(Length::Fixed(120.));
+            .width(Length::Fixed(width));
         let bg = if selected {
             Color::from_rgb8(0x2e, 0x7d, 0x5a)
         } else {
             Color::from_rgb8(0x1a, 0x1a, 0x2e)
         };
+        let border_color = if selected {
+            Color::from_rgb8(0x4a, 0x80, 0xa0)
+        } else {
+            Color::from_rgb8(0x30, 0x38, 0x50)
+        };
+        let id = g.id.clone();
+
         mouse_area(
             container(inner)
-                .padding(10)
+                .padding(8)
+                .width(Length::Fixed(width))
                 .style(move |_theme| container::Style {
                     background: Some(bg.into()),
                     border: iced::Border {
                         radius: 8.0.into(),
-                        ..Default::default()
+                        color: border_color,
+                        width: 1.0,
                     },
                     ..Default::default()
                 }),
