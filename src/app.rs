@@ -1031,29 +1031,35 @@ impl Launcher {
             let total = games.len();
             let tile_width: f32 = 100.0;
             let spacing: f32 = 8.0;
-            let inner_padding: f32 = 8.0;
-            let content_width = self.window_width - inner_padding * 2.0;
-            let cols = ((content_width - spacing) / (tile_width + spacing)).floor() as usize;
-            let cols = cols.max(1);
-            let rows = (total + cols - 1) / cols;
+            let cols = ((self.window_width - spacing) / (tile_width + spacing)).floor() as usize;
+            let cols = if cols < 1 { 1 } else { cols };
 
-            let mut row_elements: Vec<Element<'_, Message>> = Vec::new();
-            for row_idx in 0..rows {
-                let mut row_tiles: Vec<Element<'_, Message>> = Vec::new();
-                for col_idx in 0..cols {
-                    let idx = row_idx * cols + col_idx;
-                    if idx < total {
-                        row_tiles.push(self.game_tile(&games[idx], tile_width));
-                    } else {
-                        row_tiles.push(container(horizontal_space()).width(Length::Fixed(tile_width)).into());
-                    }
-                }
-                row_elements.push(row(row_tiles).spacing(spacing).align_y(Alignment::Start).into());
+            let row_count = (total + cols - 1) / cols;
+
+            let mut rows_vec: Vec<Element<'_, Message>> = Vec::with_capacity(row_count);
+            for row_idx in 0..row_count {
+                let tiles: Vec<Element<'_, Message>> = games
+                    .iter()
+                    .skip(row_idx * cols)
+                    .take(cols)
+                    .map(|g| self.game_tile(g, tile_width))
+                    .collect();
+                rows_vec.push(row(tiles).spacing(spacing).width(Fill).into());
             }
 
-            scrollable(column(row_elements).spacing(spacing))
-                .height(Fill)
-                .into()
+            let content = column(rows_vec).spacing(spacing);
+
+            if row_count <= 1 {
+                container(content)
+                    .width(Fill)
+                    .height(Fill)
+                    .center_y(Fill)
+                    .into()
+            } else {
+                scrollable(content)
+                    .height(Fill)
+                    .into()
+            }
         }
     }
 
