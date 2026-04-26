@@ -8,13 +8,18 @@ mod settings;
 
 fn main() -> iced::Result {
     let app_dir = core::app_data_dir();
-    let settings = settings::Settings::load_or_create(&app_dir);
+    let (settings, settings_warning) = settings::Settings::load_or_create(&app_dir);
 
     // Production-style: always GUI subsystem (no console), logs go to file.
     // Runtime `mode` switches verbosity, not cargo build profile.
     init_logging(&app_dir, settings.mode);
 
-    app::run(settings)
+    if let Some(warning) = settings_warning.as_deref() {
+        tracing::warn!("{warning}");
+    }
+
+    let startup_warnings = settings_warning.into_iter().collect();
+    app::run(settings, startup_warnings)
 }
 
 fn init_logging(app_dir: &std::path::Path, mode: settings::AppMode) {

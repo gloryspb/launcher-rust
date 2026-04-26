@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -9,16 +10,17 @@ use iced::widget::{
 };
 use iced::window;
 use iced::{
-    event, keyboard, Alignment, Color, Element, Event, Length, Subscription, Task, Theme,
+    event, keyboard, mouse, Alignment, Color, Element, Event, Length, Point, Subscription, Task,
+    Theme,
 };
 use iced::{Center, Fill};
 
-use crate::core::{app_data_dir, is_gate_open, is_steam_uri};
+use crate::core::{app_data_dir, is_gate_open, is_uri};
 use crate::drop_resolve::{self, ResolvedDrop};
 use crate::game_store::{Game, GameStore};
 use crate::settings::{AppMode, Settings};
 
-pub fn run(settings: Settings) -> iced::Result {
+pub fn run(settings: Settings, startup_warnings: Vec<String>) -> iced::Result {
     iced::application("Game Launcher", Launcher::update, Launcher::view)
         .subscription(Launcher::subscription)
         .theme(|_| Theme::Dark)
@@ -28,7 +30,7 @@ pub fn run(settings: Settings) -> iced::Result {
             min_size: Some(iced::Size::new(920.0, 520.0)),
             ..window::Settings::default()
         })
-        .run_with(|| Launcher::new(settings))
+        .run_with(|| Launcher::new(settings, startup_warnings))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +43,9 @@ pub enum ViewMode {
 enum Modal {
     None,
     Alert(String),
-    ConfirmDelete { ids: Vec<String> },
+    ConfirmDelete {
+        ids: Vec<String>,
+    },
     AddManual {
         name: String,
         path: String,
@@ -66,14 +70,24 @@ struct BatchRow {
 }
 
 #[derive(Debug, Clone)]
+struct DragState {
+    source_id: String,
+    source_index: usize,
+    hover_id: Option<String>,
+    started_at: Point,
+    is_active: bool,
+}
+
+#[derive(Debug, Clone)]
 pub enum Message {
     ModifiersChanged(keyboard::Modifiers),
     ViewMode(ViewMode),
-    RowClicked(String),
-    RowRightClick(String),
-    TileClicked(String),
-    MoveUp,
-    MoveDown,
+    GamePressed(String),
+    GameRightPressed(String),
+    DragEntered(String),
+    DragExited(String),
+    CursorMoved(Point),
+    PointerReleased,
     Launch,
     RemovePressed,
     ConfirmDeleteYes,
@@ -113,29 +127,43 @@ pub enum Message {
 pub struct Launcher {
     app_dir: PathBuf,
     store: GameStore,
+    icon_cache: RefCell<HashMap<String, image::Handle>>,
     view_mode: ViewMode,
     window_width: f32,
     selection: HashSet<String>,
     modifiers: keyboard::Modifiers,
+    cursor_position: Option<Point>,
+    drag_state: Option<DragState>,
     last_click: Option<(String, Instant)>,
     modal: Modal,
     mode: AppMode,
 }
 
 impl Launcher {
-    fn new(settings: Settings) -> (Self, Task<Message>) {
+    fn new(settings: Settings, mut startup_warnings: Vec<String>) -> (Self, Task<Message>) {
         let app_dir = app_data_dir();
-        let store = GameStore::new(&app_dir);
+        let mut store = GameStore::new(&app_dir);
+        if let Some(warning) = store.take_startup_warning() {
+            startup_warnings.push(warning);
+        }
+        let modal = if startup_warnings.is_empty() {
+            Modal::None
+        } else {
+            Modal::Alert(startup_warnings.join("\n\n"))
+        };
         (
             Self {
                 app_dir,
                 store,
+                icon_cache: RefCell::new(HashMap::new()),
                 view_mode: ViewMode::List,
                 window_width: 920.0,
                 selection: HashSet::new(),
                 modifiers: keyboard::Modifiers::default(),
+                cursor_position: None,
+                drag_state: None,
                 last_click: None,
-                modal: Modal::None,
+                modal,
                 mode: settings.mode,
             },
             Task::none(),
@@ -149,8 +177,14 @@ impl Launcher {
                 Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
                     Some(Message::ModifiersChanged(m))
                 }
+                Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                    Some(Message::CursorMoved(position))
+                }
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                    Some(Message::PointerReleased)
+                }
                 Event::Window(window::Event::Resized(size)) => {
-                    Some(Message::WindowResized(size.width as f32))
+                    Some(Message::WindowResized(size.width))
                 }
                 _ => None,
             }),
@@ -170,15 +204,14 @@ impl Launcher {
             Message::ViewMode(m) => {
                 self.view_mode = m;
                 self.selection.clear();
+                self.drag_state = None;
                 self.last_click = None;
                 Task::none()
             }
-            Message::RowClicked(id) => {
+            Message::GamePressed(id) => {
                 let now = Instant::now();
-                let double = self
-                    .last_click
-                    .as_ref()
-                    .is_some_and(|(prev, t)| {
+                let double = self.view_mode == ViewMode::List
+                    && self.last_click.as_ref().is_some_and(|(prev, t)| {
                         prev == &id && now.duration_since(*t) < Duration::from_millis(450)
                     });
                 self.last_click = Some((id.clone(), now));
@@ -191,52 +224,62 @@ impl Launcher {
                     if self.selection.contains(&id) {
                         self.selection.remove(&id);
                     } else {
-                        self.selection.insert(id);
+                        self.selection.insert(id.clone());
                     }
                 } else {
                     self.selection.clear();
-                    self.selection.insert(id);
+                    self.selection.insert(id.clone());
                 }
+                self.drag_state = self.game_index(&id).map(|source_index| DragState {
+                    source_id: id,
+                    source_index,
+                    hover_id: None,
+                    started_at: self.cursor_position.unwrap_or(Point::ORIGIN),
+                    is_active: false,
+                });
                 Task::none()
             }
-            Message::RowRightClick(id) => {
+            Message::GameRightPressed(id) => {
                 self.selection.clear();
                 self.selection.insert(id);
+                self.drag_state = None;
                 Task::none()
             }
-            Message::TileClicked(id) => {
-                if self.modifiers.control() {
-                    if self.selection.contains(&id) {
-                        self.selection.remove(&id);
-                    } else {
-                        self.selection.insert(id);
+            Message::DragEntered(id) => {
+                if let Some(drag) = &mut self.drag_state {
+                    drag.hover_id = Some(id);
+                }
+                Task::none()
+            }
+            Message::DragExited(id) => {
+                if let Some(drag) = &mut self.drag_state {
+                    if drag.hover_id.as_deref() == Some(id.as_str()) {
+                        drag.hover_id = None;
                     }
-                } else {
-                    self.selection.clear();
-                    self.selection.insert(id);
-                }
-                self.last_click = None;
-                Task::none()
-            }
-            Message::MoveUp => {
-                if self.view_mode == ViewMode::List && self.selection.len() == 1 {
-                    let id = self.selection.iter().next().unwrap().clone();
-                    let _ = self.store.move_game(&id, -1);
                 }
                 Task::none()
             }
-            Message::MoveDown => {
-                if self.view_mode == ViewMode::List && self.selection.len() == 1 {
-                    let id = self.selection.iter().next().unwrap().clone();
-                    let _ = self.store.move_game(&id, 1);
+            Message::CursorMoved(position) => {
+                self.cursor_position = Some(position);
+                if let Some(drag) = &mut self.drag_state {
+                    if !drag.is_active {
+                        let delta = position - drag.started_at;
+                        if delta.x.abs() > 6.0 || delta.y.abs() > 6.0 {
+                            drag.is_active = true;
+                            drag.hover_id = Some(drag.source_id.clone());
+                            self.last_click = None;
+                        }
+                    }
                 }
+                Task::none()
+            }
+            Message::PointerReleased => {
+                self.finish_drag_reorder();
                 Task::none()
             }
             Message::Launch => {
                 if !is_gate_open(&self.app_dir) {
-                    self.modal = Modal::Alert(
-                        "Сначала выполни задание (гейт закрыт).".to_string(),
-                    );
+                    self.modal = Modal::Alert("Сначала выполни задание (гейт закрыт).".to_string());
                     return Task::none();
                 }
                 if self.selection.len() != 1 {
@@ -253,7 +296,7 @@ impl Launcher {
                     self.modal = Modal::Alert("Пустой путь.".to_string());
                     return Task::none();
                 }
-                if !is_steam_uri(p) && !Path::new(p).exists() {
+                if !is_uri(p) && !Path::new(p).exists() {
                     self.modal = Modal::Alert("Файл игры не найден.".to_string());
                     return Task::none();
                 }
@@ -272,7 +315,8 @@ impl Launcher {
                 Task::none()
             }
             Message::ConfirmDeleteYes => {
-                if let Modal::ConfirmDelete { ids } = std::mem::replace(&mut self.modal, Modal::None)
+                if let Modal::ConfirmDelete { ids } =
+                    std::mem::replace(&mut self.modal, Modal::None)
                 {
                     let mut errs = Vec::new();
                     for id in ids {
@@ -419,8 +463,11 @@ impl Launcher {
                 Task::none()
             }
             Message::EditSave => {
-                if let Modal::Edit { id, name, icon_path } =
-                    std::mem::replace(&mut self.modal, Modal::None)
+                if let Modal::Edit {
+                    id,
+                    name,
+                    icon_path,
+                } = std::mem::replace(&mut self.modal, Modal::None)
                 {
                     if let Err(e) = self
                         .store
@@ -598,6 +645,88 @@ impl Launcher {
         self.ingest_dropped_paths(&mut buf);
     }
 
+    fn game_index(&self, game_id: &str) -> Option<usize> {
+        self.store.games.iter().position(|game| game.id == game_id)
+    }
+
+    fn finish_drag_reorder(&mut self) {
+        let Some(drag) = self.drag_state.take() else {
+            return;
+        };
+
+        if !drag.is_active {
+            return;
+        }
+
+        let Some(target_id) = drag.hover_id else {
+            return;
+        };
+
+        if target_id == drag.source_id {
+            return;
+        }
+
+        let Some(target_index) = self.game_index(&target_id) else {
+            return;
+        };
+
+        let insert_at = if drag.source_index < target_index {
+            target_index.saturating_sub(1)
+        } else {
+            target_index
+        };
+
+        if let Err(error) = self.store.move_game_to(&drag.source_id, insert_at) {
+            self.modal = Modal::Alert(error.to_string());
+        }
+    }
+
+    fn is_drag_source(&self, game_id: &str) -> bool {
+        self.drag_state
+            .as_ref()
+            .is_some_and(|drag| drag.is_active && drag.source_id == game_id)
+    }
+
+    fn is_drag_target(&self, game_id: &str) -> bool {
+        self.drag_state.as_ref().is_some_and(|drag| {
+            drag.is_active && drag.source_id != game_id && drag.hover_id.as_deref() == Some(game_id)
+        })
+    }
+
+    fn drag_interaction(&self, is_source: bool) -> mouse::Interaction {
+        if is_source {
+            mouse::Interaction::Grabbing
+        } else {
+            mouse::Interaction::Grab
+        }
+    }
+
+    fn icon_widget<'a>(
+        &'a self,
+        icon: &'a str,
+        config_parent: &'a Path,
+        size: u16,
+    ) -> Element<'a, Message> {
+        let path = drop_resolve::normalize_icon_path_for_preview(icon, config_parent);
+        if icon.trim().is_empty() || !path.exists() {
+            return icon_widget(icon, config_parent, size);
+        }
+
+        let key = path.to_string_lossy().to_string();
+        let handle = {
+            let mut cache = self.icon_cache.borrow_mut();
+            cache
+                .entry(key)
+                .or_insert_with(|| image::Handle::from_path(&path))
+                .clone()
+        };
+
+        image(handle)
+            .width(Length::Fixed(f32::from(size)))
+            .height(Length::Fixed(f32::from(size)))
+            .into()
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let gate_ok = is_gate_open(&self.app_dir);
         let mode_badge = match self.mode {
@@ -620,52 +749,62 @@ impl Launcher {
 
         let can_launch = gate_ok && self.selection.len() == 1;
         let has_sel = !self.selection.is_empty();
-        let list_single = self.view_mode == ViewMode::List && self.selection.len() == 1;
+        let _list_single = self.view_mode == ViewMode::List && self.selection.len() == 1;
 
         let toolbar = row![
-            button("▶ Запустить")
-                .on_press_maybe(can_launch.then_some(Message::Launch)),
+            button("▶ Запустить").on_press_maybe(can_launch.then_some(Message::Launch)),
             button("+ Добавить").on_press(Message::AddPressed),
             button("+ Несколько…").on_press(Message::AddPickMany),
             button("✎ Изменить").on_press(Message::EditPressed),
             button("✕ Удалить").on_press_maybe(has_sel.then_some(Message::RemovePressed)),
             horizontal_space(),
-            radio("Список", ViewMode::List, Some(self.view_mode), Message::ViewMode),
-            radio("Плитки", ViewMode::Tiles, Some(self.view_mode), Message::ViewMode),
+            radio(
+                "Список",
+                ViewMode::List,
+                Some(self.view_mode),
+                Message::ViewMode
+            ),
+            radio(
+                "Плитки",
+                ViewMode::Tiles,
+                Some(self.view_mode),
+                Message::ViewMode
+            ),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
 
-        let reorder: Element<'_, Message> = if self.view_mode == ViewMode::List {
-            row![
-                button("↑").on_press_maybe(list_single.then_some(Message::MoveUp)),
-                button("↓").on_press_maybe(list_single.then_some(Message::MoveDown)),
-                text(" (порядок в списке)").size(12),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center)
-            .into()
-        } else {
-            row![].into()
-        };
+        let reorder: Element<'_, Message> = row![].into(); /*
+                                                               row![
+                                                                   button("↑").on_press_maybe(list_single.then_some(Message::MoveUp)),
+                                                                   button("↓").on_press_maybe(list_single.then_some(Message::MoveDown)),
+                                                                   text(" (порядок в списке)").size(12),
+                                                               ]
+                                                               .spacing(6)
+                                                               .align_y(Alignment::Center)
+                                                               .into()
+                                                           } else {
+                                                               row![].into()
+                                                           }; */
 
         let body: Element<'_, Message> = match self.view_mode {
             ViewMode::List => self.view_list(),
             ViewMode::Tiles => self.view_tiles(),
         };
 
-        let body_container = container(body)
-            .height(Fill)
-            .padding(4)
-            .style(|_theme| container::Style {
-                background: Some(Color::from_rgb8(0x10, 0x14, 0x24).into()),
-                border: iced::Border {
-                    radius: 8.0.into(),
-                    color: Color::from_rgb8(0x3a, 0x40, 0x5a),
-                    width: 1.0,
-                },
-                ..Default::default()
-            });
+        let body_container =
+            container(body)
+                .height(Fill)
+                .padding(4)
+                .style(|_theme| container::Style {
+                    background: Some(Color::from_rgb8(0x10, 0x14, 0x24).into()),
+                    border: iced::Border {
+                        radius: 8.0.into(),
+                        color: Color::from_rgb8(0x3a, 0x40, 0x5a),
+                        width: 1.0,
+                    },
+                    ..Default::default()
+                });
 
         let main = column![
             text("GAME LAUNCHER").size(20),
@@ -674,11 +813,7 @@ impl Launcher {
             toolbar,
             reorder,
             body_container,
-            text(format!(
-                "Данные: {}",
-                self.store.config_path.display()
-            ))
-            .size(11),
+            text(format!("Данные: {}", self.store.config_path.display())).size(11),
         ]
         .spacing(8)
         .padding(12);
@@ -832,9 +967,7 @@ impl Launcher {
                                 ]
                                 .spacing(8)
                                 .align_y(Alignment::Center),
-                                row![
-                                    button("Убрать иконку").on_press(Message::EditClearIcon),
-                                ],
+                                row![button("Убрать иконку").on_press(Message::EditClearIcon),],
                                 row![
                                     button("Сохранить").on_press(Message::EditSave),
                                     button("Отмена").on_press(Message::EditCancel),
@@ -867,12 +1000,14 @@ impl Launcher {
                 opaque(
                     container(
                         column![
-                            text(format!("Добавить игры: {} (снимай галочки с лишних)", rows.len()))
-                                .size(16),
+                            text(format!(
+                                "Добавить игры: {} (снимай галочки с лишних)",
+                                rows.len()
+                            ))
+                            .size(16),
                             scrollable(
                                 column(
-                                    rows
-                                        .iter()
+                                    rows.iter()
                                         .enumerate()
                                         .map(|(i, r)| {
                                             batch_row_view(i, r).map(move |m| match m {
@@ -935,9 +1070,14 @@ impl Launcher {
             .padding(16)
             .into()
         } else {
-            let list_column: Vec<Element<'_, Message>> = self.store.games.iter().map(|g| self.game_row_list(g)).collect();
+            let list_column: Vec<Element<'_, Message>> = self
+                .store
+                .games
+                .iter()
+                .map(|g| self.game_row_list(g))
+                .collect();
 
-            scrollable(column(list_column).spacing(2).width(Fill))
+            scrollable(column(list_column).spacing(8).padding(8).width(Fill))
                 .height(Fill)
                 .into()
         }
@@ -945,6 +1085,8 @@ impl Launcher {
 
     fn game_row_list<'a>(&'a self, g: &'a Game) -> Element<'a, Message> {
         let selected = self.selection.contains(&g.id);
+        let drag_source = self.is_drag_source(&g.id);
+        let drag_target = self.is_drag_target(&g.id);
         let mark = if GameStore::path_exists_for_display(&g.path) {
             "✓"
         } else {
@@ -955,17 +1097,15 @@ impl Launcher {
         } else {
             Color::from_rgb8(0xb8, 0x5c, 0x5c)
         };
-        let icon_el: Element<'a, Message> = icon_widget(
+        let icon_el: Element<'a, Message> = self.icon_widget(
             &g.icon,
             self.store.config_path.parent().unwrap_or(Path::new(".")),
             32,
         );
         let name_el = text(&g.name).size(14);
-        let path_el = text(&g.path)
-            .size(11)
-            .style(|_| text::Style {
-                color: Some(Color::from_rgb8(0x70, 0x70, 0x80)),
-            });
+        let path_el = text(&g.path).size(11).style(|_| text::Style {
+            color: Some(Color::from_rgb8(0x70, 0x70, 0x80)),
+        });
         let mark_el = text(mark).size(14).style(move |_| text::Style {
             color: Some(mark_color),
         });
@@ -973,20 +1113,26 @@ impl Launcher {
         let row_content = row![
             icon_el,
             mark_el,
-            column![name_el, path_el]
-                .spacing(2)
-                .width(Fill),
+            column![name_el, path_el].spacing(2).width(Fill),
         ]
         .spacing(12)
         .align_y(Alignment::Center)
         .padding(12);
 
-        let bg = if selected {
+        let bg = if drag_target {
+            Color::from_rgb8(0x54, 0x5a, 0x1f)
+        } else if drag_source {
+            Color::from_rgb8(0x25, 0x2d, 0x3d)
+        } else if selected {
             Color::from_rgb8(0x2a, 0x38, 0x50)
         } else {
             Color::from_rgb8(0x1a, 0x1f, 0x30)
         };
-        let border_color = if selected {
+        let border_color = if drag_target {
+            Color::from_rgb8(0xd4, 0xb4, 0x44)
+        } else if drag_source {
+            Color::from_rgb8(0x5e, 0x7b, 0xa0)
+        } else if selected {
             Color::from_rgb8(0x4a, 0x60, 0x80)
         } else {
             Color::from_rgb8(0x28, 0x30, 0x44)
@@ -1006,8 +1152,11 @@ impl Launcher {
                     ..Default::default()
                 }),
         )
-        .on_press(Message::RowClicked(id.clone()))
-        .on_right_press(Message::RowRightClick(id))
+        .on_press(Message::GamePressed(id.clone()))
+        .on_right_press(Message::GameRightPressed(id.clone()))
+        .on_enter(Message::DragEntered(id.clone()))
+        .on_exit(Message::DragExited(id))
+        .interaction(self.drag_interaction(drag_source))
         .into()
     }
 
@@ -1034,7 +1183,7 @@ impl Launcher {
             let cols = ((self.window_width - spacing) / (tile_width + spacing)).floor() as usize;
             let cols = if cols < 1 { 1 } else { cols };
 
-            let row_count = (total + cols - 1) / cols;
+            let row_count = total.div_ceil(cols);
 
             let mut rows_vec: Vec<Element<'_, Message>> = Vec::with_capacity(row_count);
             for row_idx in 0..row_count {
@@ -1047,7 +1196,7 @@ impl Launcher {
                 rows_vec.push(row(tiles).spacing(spacing).width(Fill).into());
             }
 
-            let content = column(rows_vec).spacing(spacing);
+            let content = column(rows_vec).spacing(spacing).padding(8);
 
             if row_count <= 1 {
                 container(content)
@@ -1056,42 +1205,45 @@ impl Launcher {
                     .center_y(Fill)
                     .into()
             } else {
-                scrollable(content)
-                    .height(Fill)
-                    .into()
+                scrollable(content).height(Fill).into()
             }
         }
     }
 
     fn game_tile<'a>(&'a self, g: &'a Game, width: f32) -> Element<'a, Message> {
         let selected = self.selection.contains(&g.id);
-        let icon_el = icon_widget(
+        let drag_source = self.is_drag_source(&g.id);
+        let drag_target = self.is_drag_target(&g.id);
+        let icon_el = self.icon_widget(
             &g.icon,
             self.store.config_path.parent().unwrap_or(Path::new(".")),
             64,
         );
-        let name = if g.name.len() > 15 {
-            format!("{}...", &g.name[..12])
-        } else {
-            g.name.clone()
-        };
+        let name = truncate_tile_name(&g.name);
         let title = text(name).size(12).align_x(Center);
         let inner = column![icon_el, title]
             .spacing(4)
             .align_x(Center)
             .width(Length::Fixed(width));
-        let bg = if selected {
+        let bg = if drag_target {
+            Color::from_rgb8(0x5a, 0x56, 0x1f)
+        } else if drag_source {
+            Color::from_rgb8(0x1b, 0x28, 0x38)
+        } else if selected {
             Color::from_rgb8(0x2e, 0x7d, 0x5a)
         } else {
             Color::from_rgb8(0x1a, 0x1a, 0x2e)
         };
-        let border_color = if selected {
+        let border_color = if drag_target {
+            Color::from_rgb8(0xd4, 0xb4, 0x44)
+        } else if drag_source {
+            Color::from_rgb8(0x62, 0x86, 0xa6)
+        } else if selected {
             Color::from_rgb8(0x4a, 0x80, 0xa0)
         } else {
             Color::from_rgb8(0x30, 0x38, 0x50)
         };
         let id = g.id.clone();
-
         mouse_area(
             container(inner)
                 .padding(8)
@@ -1106,8 +1258,22 @@ impl Launcher {
                     ..Default::default()
                 }),
         )
-        .on_press(Message::TileClicked(g.id.clone()))
+        .on_press(Message::GamePressed(id.clone()))
+        .on_right_press(Message::GameRightPressed(id.clone()))
+        .on_enter(Message::DragEntered(id.clone()))
+        .on_exit(Message::DragExited(id))
+        .interaction(self.drag_interaction(drag_source))
         .into()
+    }
+}
+
+fn truncate_tile_name(value: &str) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(12).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        value.to_string()
     }
 }
 
@@ -1122,9 +1288,7 @@ enum BatchMsg {
 fn batch_row_view(i: usize, r: &BatchRow) -> Element<'_, BatchMsg> {
     column![
         row![
-            checkbox("", r.enabled)
-                .on_toggle(BatchMsg::Toggle)
-                .size(18),
+            checkbox("", r.enabled).on_toggle(BatchMsg::Toggle).size(18),
             text(format!("#{i}")).size(11),
             horizontal_space(),
         ]

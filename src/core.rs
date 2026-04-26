@@ -10,6 +10,16 @@ pub fn app_data_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
 }
 
+pub fn is_uri(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+
+    let lower = value.to_ascii_lowercase();
+    lower.contains("://") || lower.starts_with("mailto:")
+}
+
 pub fn is_steam_uri(value: &str) -> bool {
     value.trim().to_ascii_lowercase().starts_with("steam://")
 }

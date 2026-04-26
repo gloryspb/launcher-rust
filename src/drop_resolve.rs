@@ -4,25 +4,34 @@ use std::path::{Path, PathBuf};
 
 use lnk::ShellLink;
 
-use crate::core::is_steam_uri;
+use crate::core::{is_steam_uri, is_uri};
 
 #[derive(Debug, Clone)]
 pub struct ResolvedDrop {
     pub name: String,
     pub target_path: String,
     pub icon_source: String,
+    pub working_dir: String,
+    pub launch_args: String,
 }
 
 pub fn resolve_drop_path(dropped: &Path) -> Result<ResolvedDrop, String> {
     let path_str = dropped.to_string_lossy().to_string();
     let lower = path_str.to_lowercase();
 
-    if is_steam_uri(&path_str) {
-        let tail = path_str.rsplit('/').next().unwrap_or("steam");
+    if is_uri(&path_str) {
+        let tail = path_str.rsplit('/').next().unwrap_or("link");
+        let prefix = if is_steam_uri(&path_str) {
+            "Steam"
+        } else {
+            "Link"
+        };
         return Ok(ResolvedDrop {
-            name: format!("Steam {tail}"),
+            name: format!("{prefix} {tail}"),
             target_path: path_str,
             icon_source: String::new(),
+            working_dir: String::new(),
+            launch_args: String::new(),
         });
     }
 
@@ -42,6 +51,8 @@ pub fn resolve_drop_path(dropped: &Path) -> Result<ResolvedDrop, String> {
             name,
             target_path: path_str,
             icon_source: String::new(),
+            working_dir: String::new(),
+            launch_args: String::new(),
         });
     }
 
@@ -74,11 +85,25 @@ fn resolve_lnk(path: &Path) -> Result<ResolvedDrop, String> {
                 .to_string()
         })
         .unwrap_or_default();
+    let working_dir = link
+        .string_data()
+        .working_dir()
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    let launch_args = link
+        .string_data()
+        .command_line_arguments()
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
 
     Ok(ResolvedDrop {
         name,
         target_path: target,
         icon_source,
+        working_dir,
+        launch_args,
     })
 }
 
@@ -117,6 +142,8 @@ fn resolve_url_shortcut(path: &Path) -> Result<ResolvedDrop, String> {
         name,
         target_path: url,
         icon_source,
+        working_dir: String::new(),
+        launch_args: String::new(),
     })
 }
 
