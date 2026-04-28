@@ -72,7 +72,6 @@ struct BatchRow {
 #[derive(Debug, Clone)]
 struct DragState {
     source_id: String,
-    source_index: usize,
     hover_id: Option<String>,
     started_at: Point,
     is_active: bool,
@@ -127,7 +126,6 @@ pub enum Message {
 pub struct Launcher {
     app_dir: PathBuf,
     store: GameStore,
-    icon_cache: RefCell<HashMap<String, image::Handle>>,
     view_mode: ViewMode,
     window_width: f32,
     selection: HashSet<String>,
@@ -135,6 +133,7 @@ pub struct Launcher {
     cursor_position: Option<Point>,
     drag_state: Option<DragState>,
     last_click: Option<(String, Instant)>,
+    icon_cache: RefCell<HashMap<String, image::Handle>>,
     modal: Modal,
     mode: AppMode,
 }
@@ -155,7 +154,6 @@ impl Launcher {
             Self {
                 app_dir,
                 store,
-                icon_cache: RefCell::new(HashMap::new()),
                 view_mode: ViewMode::List,
                 window_width: 920.0,
                 selection: HashSet::new(),
@@ -163,6 +161,7 @@ impl Launcher {
                 cursor_position: None,
                 drag_state: None,
                 last_click: None,
+                icon_cache: RefCell::new(HashMap::new()),
                 modal,
                 mode: settings.mode,
             },
@@ -230,9 +229,8 @@ impl Launcher {
                     self.selection.clear();
                     self.selection.insert(id.clone());
                 }
-                self.drag_state = self.game_index(&id).map(|source_index| DragState {
+                self.drag_state = self.game_index(&id).map(|_| DragState {
                     source_id: id,
-                    source_index,
                     hover_id: None,
                     started_at: self.cursor_position.unwrap_or(Point::ORIGIN),
                     is_active: false,
@@ -670,13 +668,7 @@ impl Launcher {
             return;
         };
 
-        let insert_at = if drag.source_index < target_index {
-            target_index.saturating_sub(1)
-        } else {
-            target_index
-        };
-
-        if let Err(error) = self.store.move_game_to(&drag.source_id, insert_at) {
+        if let Err(error) = self.store.move_game_to(&drag.source_id, target_index) {
             self.modal = Modal::Alert(error.to_string());
         }
     }
@@ -693,23 +685,36 @@ impl Launcher {
         })
     }
 
-    fn drag_interaction(&self, is_source: bool) -> mouse::Interaction {
-        if is_source {
-            mouse::Interaction::Grabbing
-        } else {
-            mouse::Interaction::Grab
+    fn drag_preview_game<'a>(&'a self, target_id: &str) -> Option<&'a Game> {
+        let drag = self.drag_state.as_ref()?;
+        if !drag.is_active
+            || drag.source_id == target_id
+            || drag.hover_id.as_deref() != Some(target_id)
+        {
+            return None;
         }
+
+        self.store.get(&drag.source_id)
     }
 
-    fn icon_widget<'a>(
-        &'a self,
-        icon: &'a str,
-        config_parent: &'a Path,
+    fn icon_widget(
+        &self,
+        icon: &str,
+        config_parent: &Path,
         size: u16,
-    ) -> Element<'a, Message> {
+    ) -> Element<'static, Message> {
         let path = drop_resolve::normalize_icon_path_for_preview(icon, config_parent);
         if icon.trim().is_empty() || !path.exists() {
-            return icon_widget(icon, config_parent, size);
+            return container(text("-").size(14))
+                .width(Length::Fixed(f32::from(size)))
+                .height(Length::Fixed(f32::from(size)))
+                .center_x(Length::Fixed(f32::from(size)))
+                .center_y(Length::Fixed(f32::from(size)))
+                .style(|_theme| container::Style {
+                    background: Some(Color::from_rgb8(0x0f, 0x34, 0x60).into()),
+                    ..Default::default()
+                })
+                .into();
         }
 
         let key = path.to_string_lossy().to_string();
@@ -749,7 +754,6 @@ impl Launcher {
 
         let can_launch = gate_ok && self.selection.len() == 1;
         let has_sel = !self.selection.is_empty();
-        let _list_single = self.view_mode == ViewMode::List && self.selection.len() == 1;
 
         let toolbar = row![
             button("▶ Запустить").on_press_maybe(can_launch.then_some(Message::Launch)),
@@ -773,19 +777,6 @@ impl Launcher {
         ]
         .spacing(8)
         .align_y(Alignment::Center);
-
-        let reorder: Element<'_, Message> = row![].into(); /*
-                                                               row![
-                                                                   button("↑").on_press_maybe(list_single.then_some(Message::MoveUp)),
-                                                                   button("↓").on_press_maybe(list_single.then_some(Message::MoveDown)),
-                                                                   text(" (порядок в списке)").size(12),
-                                                               ]
-                                                               .spacing(6)
-                                                               .align_y(Alignment::Center)
-                                                               .into()
-                                                           } else {
-                                                               row![].into()
-                                                           }; */
 
         let body: Element<'_, Message> = match self.view_mode {
             ViewMode::List => self.view_list(),
@@ -811,7 +802,6 @@ impl Launcher {
             mode_badge,
             status,
             toolbar,
-            reorder,
             body_container,
             text(format!("Данные: {}", self.store.config_path.display())).size(11),
         ]
@@ -1087,37 +1077,49 @@ impl Launcher {
         let selected = self.selection.contains(&g.id);
         let drag_source = self.is_drag_source(&g.id);
         let drag_target = self.is_drag_target(&g.id);
-        let mark = if GameStore::path_exists_for_display(&g.path) {
+        let preview_game = self.drag_preview_game(&g.id);
+        let display_game = preview_game.unwrap_or(g);
+        let is_preview = preview_game.is_some();
+        let mark = if GameStore::path_exists_for_display(&display_game.path) {
             "✓"
         } else {
             "✗"
         };
-        let mark_color = if GameStore::path_exists_for_display(&g.path) {
+        let mark_color = if GameStore::path_exists_for_display(&display_game.path) {
             Color::from_rgb8(0x4e, 0xcc, 0xa3)
         } else {
             Color::from_rgb8(0xb8, 0x5c, 0x5c)
         };
-        let icon_el: Element<'a, Message> = self.icon_widget(
-            &g.icon,
+        let icon_el: Element<'static, Message> = self.icon_widget(
+            &display_game.icon,
             self.store.config_path.parent().unwrap_or(Path::new(".")),
             32,
         );
-        let name_el = text(&g.name).size(14);
-        let path_el = text(&g.path).size(11).style(|_| text::Style {
+        let name_el = text(&display_game.name).size(14);
+        let path_el = text(&display_game.path).size(11).style(|_| text::Style {
             color: Some(Color::from_rgb8(0x70, 0x70, 0x80)),
         });
         let mark_el = text(mark).size(14).style(move |_| text::Style {
             color: Some(mark_color),
         });
+        let meta_col = if is_preview {
+            column![
+                text("PREVIEW").size(10).style(|_| text::Style {
+                    color: Some(Color::from_rgb8(0xf0, 0xc6, 0x63)),
+                }),
+                name_el,
+                path_el,
+            ]
+        } else {
+            column![name_el, path_el]
+        }
+        .spacing(2)
+        .width(Fill);
 
-        let row_content = row![
-            icon_el,
-            mark_el,
-            column![name_el, path_el].spacing(2).width(Fill),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center)
-        .padding(12);
+        let row_content = row![icon_el, mark_el, meta_col,]
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .padding(12);
 
         let bg = if drag_target {
             Color::from_rgb8(0x54, 0x5a, 0x1f)
@@ -1156,7 +1158,6 @@ impl Launcher {
         .on_right_press(Message::GameRightPressed(id.clone()))
         .on_enter(Message::DragEntered(id.clone()))
         .on_exit(Message::DragExited(id))
-        .interaction(self.drag_interaction(drag_source))
         .into()
     }
 
@@ -1214,14 +1215,27 @@ impl Launcher {
         let selected = self.selection.contains(&g.id);
         let drag_source = self.is_drag_source(&g.id);
         let drag_target = self.is_drag_target(&g.id);
-        let icon_el = self.icon_widget(
-            &g.icon,
+        let preview_game = self.drag_preview_game(&g.id);
+        let display_game = preview_game.unwrap_or(g);
+        let is_preview = preview_game.is_some();
+        let icon_el: Element<'static, Message> = self.icon_widget(
+            &display_game.icon,
             self.store.config_path.parent().unwrap_or(Path::new(".")),
             64,
         );
-        let name = truncate_tile_name(&g.name);
+        let name = truncate_tile_name(&display_game.name);
         let title = text(name).size(12).align_x(Center);
-        let inner = column![icon_el, title]
+        let preview_badge: Element<'_, Message> = if is_preview {
+            text("PREVIEW")
+                .size(10)
+                .style(|_| text::Style {
+                    color: Some(Color::from_rgb8(0xf0, 0xc6, 0x63)),
+                })
+                .into()
+        } else {
+            text("").size(10).into()
+        };
+        let inner = column![preview_badge, icon_el, title]
             .spacing(4)
             .align_x(Center)
             .width(Length::Fixed(width));
@@ -1262,7 +1276,6 @@ impl Launcher {
         .on_right_press(Message::GameRightPressed(id.clone()))
         .on_enter(Message::DragEntered(id.clone()))
         .on_exit(Message::DragExited(id))
-        .interaction(self.drag_interaction(drag_source))
         .into()
     }
 }
@@ -1310,24 +1323,4 @@ fn batch_row_view(i: usize, r: &BatchRow) -> Element<'_, BatchMsg> {
     .spacing(6)
     .padding(8)
     .into()
-}
-
-fn icon_widget<'a>(icon: &'a str, config_parent: &'a Path, size: u16) -> Element<'a, Message> {
-    let p = drop_resolve::normalize_icon_path_for_preview(icon, config_parent);
-    if icon.trim().is_empty() || !p.exists() {
-        return container(text("—").size(14))
-            .width(Length::Fixed(f32::from(size)))
-            .height(Length::Fixed(f32::from(size)))
-            .center_x(Length::Fixed(f32::from(size)))
-            .center_y(Length::Fixed(f32::from(size)))
-            .style(|_theme| container::Style {
-                background: Some(Color::from_rgb8(0x0f, 0x34, 0x60).into()),
-                ..Default::default()
-            })
-            .into();
-    }
-    image(p)
-        .width(Length::Fixed(f32::from(size)))
-        .height(Length::Fixed(f32::from(size)))
-        .into()
 }

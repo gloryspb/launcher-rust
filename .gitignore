@@ -4,6 +4,8 @@
 
 /target/
 **/target/
+/target-codex/
+/target-codex-*/
 
 Cargo.lock
 
